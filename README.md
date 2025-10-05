@@ -1,3 +1,3 @@
 # Typing-Test
 #Varun Shrivastava
-#Adarsh Jain
+#Adarsh pandey

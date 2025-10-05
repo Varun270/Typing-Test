@@ -15,11 +15,11 @@ jobs:
       - name: Run spam detection
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AUTO_CLOSE: false       # set to "true" if you want the bot to close spammy PRs
+          AUTO_CLOSE: false
           SCORE_THRESHOLD: 3
         run: |
           python3 - <<'PYCODE'
-          import os, re, requests, json
+          import os, re, requests, json, sys
 
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GITHUB_TOKEN"]
@@ -34,7 +34,24 @@ jobs:
           api_pr_url = pr["url"]
 
           headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-          files = requests.get(api_pr_url + "/files", headers=headers).json()
+          
+          # Ensure spam-pr label exists
+          labels_api = f"https://api.github.com/repos/{repo}/labels"
+          existing_labels = requests.get(labels_api, headers=headers).json()
+          if not any(l.get("name") == "spam-pr" for l in existing_labels):
+              print("Creating spam-pr label...")
+              resp = requests.post(labels_api, headers=headers, json={
+                  "name": "spam-pr",
+                  "color": "d73a4a",
+                  "description": "Detected as potential spam"
+              })
+              print(f"Label creation status: {resp.status_code}")
+          
+          files_resp = requests.get(api_pr_url + "/files", headers=headers)
+          if files_resp.status_code != 200:
+              print(f"Error fetching files: {files_resp.status_code}")
+              sys.exit(1)
+          files = files_resp.json()
 
           score, reasons = 0.0, []
           total_changes = sum(f["additions"] + f["deletions"] for f in files)
@@ -66,18 +83,23 @@ jobs:
           if score >= threshold:
               label_api = f"https://api.github.com/repos/{repo}/issues/{pr_num}/labels"
               comment_api = f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments"
-              requests.post(label_api, headers=headers, json={"labels": ["spam-pr"]})
+              
+              label_resp = requests.post(label_api, headers=headers, json={"labels": ["spam-pr"]})
+              print(f"Label API response: {label_resp.status_code} - {label_resp.text}")
+              
               msg = (
                   "🤖 **Spam PR Detector**\n\n"
                   f"This PR appears to be low-value or spammy (score: {score:.1f}).\n\n"
                   f"Reasons: {', '.join(reasons)}.\n\n"
                   "If this is legitimate, please update the PR description to explain its purpose."
               )
-              requests.post(comment_api, headers=headers, json={"body": msg})
+              comment_resp = requests.post(comment_api, headers=headers, json={"body": msg})
+              print(f"Comment API response: {comment_resp.status_code}")
+              
               if auto_close:
                   pr_api = f"https://api.github.com/repos/{repo}/pulls/{pr_num}"
-                  requests.patch(pr_api, headers=headers, json={"state": "closed"})
-                  print("PR closed.")
+                  close_resp = requests.patch(pr_api, headers=headers, json={"state": "closed"})
+                  print(f"Close PR response: {close_resp.status_code}")
               else:
                   print("Labeled as spam-pr.")
           else:

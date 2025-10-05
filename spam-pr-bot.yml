@@ -1,0 +1,85 @@
+name: Spam PR Detector
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  detect-spam:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Run spam detection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTO_CLOSE: false       # set to "true" if you want the bot to close spammy PRs
+          SCORE_THRESHOLD: 3
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, requests, json
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          threshold = float(os.environ.get("SCORE_THRESHOLD", 3))
+          auto_close = os.environ.get("AUTO_CLOSE", "false").lower() == "true"
+
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          with open(event_path) as f:
+              event = json.load(f)
+          pr = event["pull_request"]
+          pr_num = pr["number"]
+          api_pr_url = pr["url"]
+
+          headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+          files = requests.get(api_pr_url + "/files", headers=headers).json()
+
+          score, reasons = 0.0, []
+          total_changes = sum(f["additions"] + f["deletions"] for f in files)
+          changed_files = len(files)
+
+          if total_changes <= 3:
+              score += 2; reasons.append(f"tiny change ({total_changes} lines)")
+          doc_only = all(re.search(r"README|CONTRIBUTING|CHANGELOG|LICENSE|\.md$", f["filename"], re.I) for f in files)
+          if doc_only:
+              score += 1.5; reasons.append("doc-only files")
+
+          name_add = False
+          for f in files:
+              patch = f.get("patch") or ""
+              added_lines = [l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++")]
+              for line in added_lines:
+                  if re.match(r"^[*>-]?\s*[A-Z][a-z]+ [A-Z][a-z]+$", line.strip()):
+                      name_add = True; break
+              if name_add: break
+          if name_add:
+              score += 2; reasons.append("name/handle added")
+
+          if re.search(r"(add my name|profile|typo|contrib|author)", pr["title"], re.I):
+              score += 1; reasons.append("weak/vanity title")
+          if changed_files == 1:
+              score += 0.5; reasons.append("single file")
+
+          print(f"Detected score={score:.1f} reasons={reasons}")
+          if score >= threshold:
+              label_api = f"https://api.github.com/repos/{repo}/issues/{pr_num}/labels"
+              comment_api = f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments"
+              requests.post(label_api, headers=headers, json={"labels": ["spam-pr"]})
+              msg = (
+                  "🤖 **Spam PR Detector**\n\n"
+                  f"This PR appears to be low-value or spammy (score: {score:.1f}).\n\n"
+                  f"Reasons: {', '.join(reasons)}.\n\n"
+                  "If this is legitimate, please update the PR description to explain its purpose."
+              )
+              requests.post(comment_api, headers=headers, json={"body": msg})
+              if auto_close:
+                  pr_api = f"https://api.github.com/repos/{repo}/pulls/{pr_num}"
+                  requests.patch(pr_api, headers=headers, json={"state": "closed"})
+                  print("PR closed.")
+              else:
+                  print("Labeled as spam-pr.")
+          else:
+              print("✅ PR seems fine.")
+          PYCODE
